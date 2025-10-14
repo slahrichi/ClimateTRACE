@@ -161,7 +161,7 @@ def download_scene(scene_id, city, api_key):
         
     download_url = r_status.json()["location"]
     
-    download_dir = f"skysat_downloads/{city}"
+    download_dir = f"/scratch/skysat_downloads/{city}"
     os.makedirs(download_dir, exist_ok=True)
     
     filename = f"{scene_id}_{ASSET_TYPE}.tif"
@@ -215,7 +215,7 @@ def run_search_and_download():
 def run_download_from_csv():
     """Download scenes directly from a CSV file."""
     print("--- Running in DOWNLOAD FROM CSV mode ---")
-    df = pd.read_csv("random_5_scenes_per_city.csv")
+    df = pd.read_csv("random_5_scenes_per_city_saad_bottom_half.csv")
     for _, row in df.iterrows():
         city = row['City']
         scene_id = row['Scene_ID']
