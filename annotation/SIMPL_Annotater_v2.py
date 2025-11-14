@@ -26,7 +26,8 @@ from tkinter import ttk, messagebox
 from PIL import Image, ImageDraw, ImageTk
 
 import torch
-from ultralytics.models.sam import Predictor as SAMPredictor
+import torch.nn.functional as F
+from ultralytics import SAM as UltralyticsSAM
 
 
 ColorPoint = Tuple[float, float]
@@ -34,22 +35,6 @@ ColorPoint = Tuple[float, float]
 
 def _now_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-
-def _percentile_stretch(arr: np.ndarray, lower: float = 2.0, upper: float = 98.0) -> np.ndarray:
-    if arr.ndim != 3:
-        raise ValueError("Expected HWC array for stretching.")
-    output = np.empty_like(arr, dtype=np.uint8)
-    for i in range(arr.shape[2]):
-        band = arr[:, :, i].astype(np.float32)
-        vmin, vmax = np.percentile(band, [lower, upper])
-        if math.isclose(vmax, vmin):
-            scaled = np.clip(band, 0, 255)
-        else:
-            scaled = (band - vmin) / (vmax - vmin)
-            scaled = np.clip(scaled, 0, 1) * 255.0
-        output[:, :, i] = scaled.astype(np.uint8)
-    return output
 
 
 def _expand_polygon(geom: Polygon | MultiPolygon | GeometryCollection) -> Polygon:
@@ -164,24 +149,6 @@ def _sanitize_filename(text: str) -> str:
     return re.sub(r"[^0-9A-Za-z._-]+", "_", text)
 
 
-def sample_negatives_in_holes(polygon: Polygon, affine: Affine, per_hole: int = 3) -> List[ColorPoint]:
-    inv = ~affine
-    negatives: List[ColorPoint] = []
-    rng = np.random.default_rng(0)
-    for interior in polygon.interiors:
-        hole_poly = Polygon(interior)
-        if hole_poly.is_empty:
-            continue
-        rp = hole_poly.representative_point()
-        col, row = inv * (rp.x, rp.y)
-        negatives.append((float(col), float(row)))
-        for _ in range(max(0, per_hole - 1)):
-            dx = (rng.random() - 0.5) * 4.0
-            dy = (rng.random() - 0.5) * 4.0
-            negatives.append((float(col + dx), float(row + dy)))
-    return negatives
-
-
 @dataclass
 class BuildingMask:
     idx: int
@@ -189,8 +156,6 @@ class BuildingMask:
     properties: Dict[str, Any]
     polygon: Polygon
     pixel_polygon: List[ColorPoint]
-    default_positive: List[ColorPoint]
-    default_negative: List[ColorPoint]
     pixel_polygon_interiors: List[List[ColorPoint]]
     bbox_row_min: float
     bbox_row_max: float
@@ -201,6 +166,7 @@ class BuildingMask:
     clicks_negative: List[ColorPoint] = field(default_factory=list)
     accepted: bool = False
     skipped: bool = False
+    deleted: bool = False
 
 
 @dataclass
@@ -212,9 +178,9 @@ class ChipData:
     col_off: int
     polygon_chip: List[ColorPoint]
     polygon_holes_chip: List[List[ColorPoint]]
-    default_positive_chip: List[ColorPoint]
-    default_negative_chip: List[ColorPoint]
     initial_mask: np.ndarray
+    rough_centroid: Optional[ColorPoint]
+    rough_bbox: Optional[Tuple[float, float, float, float]]
 
 
 class ImageSession:
@@ -224,8 +190,6 @@ class ImageSession:
         annotations_path: Path,
         annotation_crs: Optional[str],
         display_bands: Optional[Sequence[int]],
-        display_max_size: int,
-        percentile: Tuple[float, float],
     ) -> None:
         self.image_path = Path(image_path).expanduser().resolve()
         self.annotations_path = Path(annotations_path).expanduser().resolve()
@@ -250,13 +214,42 @@ class ImageSession:
                 valid_geom = box(*src.bounds)
 
             clipped, clipped_transform = rio_mask(src, [mapping(valid_geom)], crop=True)
-            if isinstance(clipped, np.ma.MaskedArray):
-                clipped = clipped.filled(0)
 
-        self.image_array = clipped
-        self.band_count = clipped.shape[0]
-        self.height = clipped.shape[1]
-        self.width = clipped.shape[2]
+            mask_array: Optional[np.ndarray] = None
+            data = clipped
+            if isinstance(clipped, np.ma.MaskedArray):
+                mask_array = np.ma.getmaskarray(clipped)
+                data = clipped.data
+
+            valid_mask: Optional[np.ndarray] = None
+            if mask_array is not None and mask_array is not np.ma.nomask:
+                valid_mask = ~np.all(mask_array, axis=0)
+            else:
+                nodata = base_profile.get("nodata")
+                if nodata is not None:
+                    valid_mask = np.any(data != nodata, axis=0)
+
+            if valid_mask is not None:
+                if not valid_mask.any():
+                    raise ValueError(f"No valid pixels found within {self.image_path.name}.")
+                row_indices = np.where(valid_mask.any(axis=1))[0]
+                col_indices = np.where(valid_mask.any(axis=0))[0]
+                row_start, row_end = int(row_indices[0]), int(row_indices[-1]) + 1
+                col_start, col_end = int(col_indices[0]), int(col_indices[-1]) + 1
+                data = data[:, row_start:row_end, col_start:col_end]
+                if mask_array is not None and mask_array is not np.ma.nomask:
+                    mask_array = mask_array[:, row_start:row_end, col_start:col_end]
+                clipped_transform = clipped_transform * Affine.translation(col_start, row_start)
+
+        if mask_array is not None and mask_array is not np.ma.nomask:
+            trimmed = np.ma.array(data, mask=mask_array).filled(0)
+        else:
+            trimmed = np.asarray(data)
+
+        self.image_array = trimmed
+        self.band_count = trimmed.shape[0]
+        self.height = trimmed.shape[1]
+        self.width = trimmed.shape[2]
         self.transform = clipped_transform
         self.valid_polygon = valid_geom
         self.bounds_polygon = box(*array_bounds(self.height, self.width, self.transform))
@@ -264,17 +257,7 @@ class ImageSession:
         self.profile = base_profile
         self.profile.update({"height": self.height, "width": self.width, "transform": self.transform})
 
-        rgb = self._build_display_array(clipped, display_bands, percentile)
-        self.display_rgb = rgb
-        if display_max_size:
-            scale = min(1.0, display_max_size / max(rgb.shape[0], rgb.shape[1]))
-            if scale < 1.0:
-                size = (int(rgb.shape[1] * scale), int(rgb.shape[0] * scale))
-                self.display_image = Image.fromarray(rgb).resize(size, resample=Image.BILINEAR)
-            else:
-                self.display_image = Image.fromarray(rgb)
-        else:
-            self.display_image = Image.fromarray(rgb)
+        self.display_rgb = self._build_display_array(clipped, display_bands)
 
         self.buildings: List[BuildingMask] = self._load_buildings(annotation_crs)
 
@@ -289,7 +272,6 @@ class ImageSession:
         self,
         clipped_array: np.ndarray,
         display_bands: Optional[Sequence[int]],
-        percentile: Tuple[float, float],
     ) -> np.ndarray:
         if display_bands is None:
             if self.band_count >= 3:
@@ -302,11 +284,13 @@ class ImageSession:
         bands = []
         for band_idx in display_bands:
             band_idx = max(1, min(self.band_count, band_idx))
-            band = clipped_array[band_idx - 1].astype(np.float32)
+            band = np.asarray(clipped_array[band_idx - 1])
             bands.append(band)
 
         stacked = np.stack(bands, axis=-1)
-        return _percentile_stretch(stacked, lower=percentile[0], upper=percentile[1])
+        if stacked.dtype != np.uint8:
+            stacked = np.clip(stacked, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(stacked)
 
     def _infer_geojson_crs(self, data: Dict[str, Any], fallback: Optional[str]) -> str:
         if "crs" in data:
@@ -353,39 +337,6 @@ class ImageSession:
 
             pixel_exterior, pixel_interiors = polygon_rings_to_pixel_coords(polygon, self.transform)
             pixel_polygon = pixel_exterior
-            perimeter_pixels = polygon.length / max(abs(self.transform.a), abs(self.transform.e))
-            default_positive = _sample_polygon_boundary(
-                polygon,
-                self.transform,
-                target_points=max(12, min(80, int(perimeter_pixels / 4))),
-                clamp_width=self.width,
-                clamp_height=self.height,
-            )
-            rep_point = polygon.representative_point()
-            rep_col, rep_row = (~self.transform) * (rep_point.x, rep_point.y)
-            default_positive.append(
-                (
-                    _clip_value(rep_col, 0, self.width - 1),
-                    _clip_value(rep_row, 0, self.height - 1),
-                )
-            )
-            default_negative = _buffer_ring_points(
-                polygon,
-                self.transform,
-                num_points=max(6, len(default_positive) // 3),
-                buffer_pixels=3.0,
-                clamp_width=self.width,
-                clamp_height=self.height,
-            )
-            hole_negatives = sample_negatives_in_holes(polygon, self.transform, per_hole=3)
-            for col, row in hole_negatives:
-                default_negative.append(
-                    (
-                        _clip_value(col, 0, self.width - 1),
-                        _clip_value(row, 0, self.height - 1),
-                    )
-                )
-
             props = feature.get("properties", {}).copy()
             cols = [p[0] for p in pixel_polygon]
             rows = [p[1] for p in pixel_polygon]
@@ -408,8 +359,6 @@ class ImageSession:
                     properties=props,
                     polygon=polygon,
                     pixel_polygon=pixel_polygon,
-                    default_positive=default_positive,
-                    default_negative=default_negative,
                     pixel_polygon_interiors=pixel_interiors,
                     bbox_row_min=bbox_row_min,
                     bbox_row_max=bbox_row_max,
@@ -455,8 +404,25 @@ class ImageSession:
             [clamp_point(col - col_min, row - row_min) for col, row in ring]
             for ring in building.pixel_polygon_interiors
         ]
-        default_positive_chip = [clamp_point(col - col_min, row - row_min) for col, row in building.default_positive]
-        default_negative_chip = [clamp_point(col - col_min, row - row_min) for col, row in building.default_negative]
+
+        rough_centroid: Optional[ColorPoint] = None
+        rough_bbox: Optional[Tuple[float, float, float, float]] = None
+        if initial_mask is not None and initial_mask.any():
+            rows, cols = np.nonzero(initial_mask)
+            if len(rows) > 0:
+                centroid_col = float(cols.mean())
+                centroid_row = float(rows.mean())
+                rough_centroid = clamp_point(centroid_col, centroid_row)
+                bbox_col_min = float(cols.min())
+                bbox_row_min = float(rows.min())
+                bbox_col_max = float(cols.max())
+                bbox_row_max = float(rows.max())
+                rough_bbox = (
+                    _clip_value(bbox_col_min, 0, chip_width - 1),
+                    _clip_value(bbox_row_min, 0, chip_height - 1),
+                    _clip_value(bbox_col_max, 0, chip_width - 1),
+                    _clip_value(bbox_row_max, 0, chip_height - 1),
+                )
 
         return ChipData(
             array=chip_array,
@@ -466,9 +432,9 @@ class ImageSession:
             col_off=col_min,
             polygon_chip=polygon_chip,
             polygon_holes_chip=polygon_holes_chip,
-            default_positive_chip=default_positive_chip,
-            default_negative_chip=default_negative_chip,
             initial_mask=initial_mask,
+            rough_centroid=rough_centroid,
+            rough_bbox=rough_bbox,
         )
 
     def rasterize_building(self, building: BuildingMask) -> np.ndarray:
@@ -484,13 +450,42 @@ class ImageSession:
 
 class SamSegmenter:
     def __init__(self, model_path: str, device: Optional[str] = None, imgsz: int = 1024) -> None:
-        overrides = dict(model=model_path, imgsz=imgsz, save=False)
-        if device:
-            overrides["device"] = device
-        self.predictor = SAMPredictor(overrides=overrides)
         self._pad_bottom = 0
         self._pad_right = 0
         self._orig_shape: Optional[Tuple[int, int]] = None
+        self.supports_box = True
+
+        try:
+            sam_model = UltralyticsSAM(model_path)
+        except Exception as exc:  # pragma: no cover - surface a clearer error
+            raise RuntimeError(f"Failed to load SAM weights from '{model_path}': {exc}") from exc
+
+        is_sam2 = bool(getattr(sam_model, "is_sam2", False))
+        if not is_sam2:
+            raise ValueError(
+                "This tool now only supports SAM 2 checkpoints. "
+                f"Provided weights '{model_path}' are not identified as SAM 2."
+            )
+
+        if isinstance(imgsz, (tuple, list)):
+            imgsz_override = tuple(int(v) for v in imgsz)
+        else:
+            imgsz_override = (int(imgsz), int(imgsz))
+
+        overrides = {
+            "model": model_path,
+            "imgsz": imgsz_override,
+            "save": False,
+            "task": "segment",
+            "mode": "predict",
+            "batch": 1,
+        }
+        if device:
+            overrides["device"] = device
+
+        predictor_cls = sam_model._smart_load("predictor")
+        self.predictor = predictor_cls(overrides=overrides, _callbacks=sam_model.callbacks)
+        self.predictor.setup_model(model=sam_model.model, verbose=False)
 
     def set_image(self, image_rgb: np.ndarray) -> None:
         if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
@@ -504,22 +499,56 @@ class SamSegmenter:
 
     def predict(
         self,
-        point_coords: np.ndarray,
-        point_labels: np.ndarray,
+        point_coords: Optional[np.ndarray] = None,
+        point_labels: Optional[np.ndarray] = None,
         box: Optional[np.ndarray] = None,
+        mask_input: Optional[np.ndarray] = None,
+        multimask_output: bool = False,
     ) -> Optional[np.ndarray]:
-        if point_coords.size == 0:
-            raise ValueError("At least one prompt point is required for SAM prediction.")
-        coords = np.asarray(point_coords, dtype=np.float32)
-        labels = np.asarray(point_labels, dtype=np.int32)
-        if coords.ndim == 1:
-            coords = coords[None, :]
-        if labels.ndim == 0:
-            labels = labels[None]
+        has_points = point_coords is not None and np.asarray(point_coords).size > 0
+        has_masks = mask_input is not None and np.asarray(mask_input).size > 0
+        has_box = box is not None
 
-        kwargs = dict(points=[coords], labels=[labels], multimask_output=False)
-        if box is not None:
-            kwargs["boxes"] = [np.asarray(box, dtype=np.float32)]
+        if not (has_points or has_masks or has_box):
+            raise ValueError("At least one prompt (points, box, or mask) is required for SAM prediction.")
+
+        kwargs: Dict[str, Any] = {"multimask_output": multimask_output}
+
+        if has_points:
+            coords = np.asarray(point_coords, dtype=np.float32)
+            if coords.ndim == 1:
+                coords = coords[None, :]
+
+            if point_labels is None:
+                labels = np.ones(coords.shape[0], dtype=np.int32)
+            else:
+                labels = np.asarray(point_labels, dtype=np.int32)
+            if labels.ndim == 0:
+                labels = labels[None]
+
+            if labels.shape[0] != coords.shape[0]:
+                raise ValueError("Point labels must align with the provided point coordinates.")
+
+            kwargs["points"] = np.expand_dims(coords, axis=0)
+            kwargs["labels"] = np.expand_dims(labels, axis=0)
+
+        if has_masks:
+            mask_arr = np.asarray(mask_input, dtype=np.float32)
+            if mask_arr.ndim == 2:
+                # single mask -> add N dimension
+                mask_arr = mask_arr[None, :, :]  # (1, H, W)
+            elif mask_arr.ndim == 3:
+                # already (N, H, W), good
+                pass
+            else:
+                raise ValueError("Mask prompt must have shape (H, W) or (N, H, W).")
+
+            # Keep as float32 (0/1 or 0..1), which matches result.masks.data
+            kwargs["masks"] = mask_arr
+
+        if box is not None and self.supports_box:
+            bbox_arr = np.asarray(box, dtype=np.float32)
+            kwargs["bboxes"] = bbox_arr[None, :] if bbox_arr.ndim == 1 else bbox_arr
 
         results = self.predictor(**kwargs)
         if not results:
@@ -550,12 +579,17 @@ class OutputManager:
         self.features: List[Dict[str, Any]] = []
         self.audit_log: List[Dict[str, Any]] = []
         self._pending_since_flush = 0
+        self.deleted_ids: set[str] = set()
 
     def record(self, building: BuildingMask, mask: np.ndarray, timestamp: str) -> None:
         geometry = self._mask_to_geometry(mask)
         if geometry is None:
             messagebox.showwarning("Mask empty", "SAM returned an empty mask; nothing saved.")
             return
+
+        building_id = building.feature_id
+        self.deleted_ids.discard(building_id)
+        self._remove_feature(building_id)
 
         feature = {
             "type": "Feature",
@@ -568,7 +602,8 @@ class OutputManager:
             {
                 "timestamp": timestamp,
                 "image_path": str(self.session.image_path),
-                "building_id": building.feature_id,
+                "building_id": building_id,
+                "action": "accept",
                 "clicks": {
                     "positive": [list(map(float, pt)) for pt in building.clicks_positive],
                     "negative": [list(map(float, pt)) for pt in building.clicks_negative],
@@ -584,6 +619,31 @@ class OutputManager:
         if self._pending_since_flush >= self.autosave_every:
             self.flush()
 
+    def record_deletion(self, building: BuildingMask, timestamp: str) -> None:
+        building_id = building.feature_id
+        self.deleted_ids.add(building_id)
+        removed = self._remove_feature(building_id)
+        if removed and self.save_masks:
+            fname = f"{self.session.stem}_{_sanitize_filename(building_id)}_mask.tif"
+            try:
+                (self.output_dir / fname).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        self.audit_log.append(
+            {
+                "timestamp": timestamp,
+                "image_path": str(self.session.image_path),
+                "building_id": building_id,
+                "action": "delete",
+                "reason": "marked_missing",
+                "mask_area_pixels": 0,
+            }
+        )
+        self._pending_since_flush += 1
+        if self._pending_since_flush >= self.autosave_every:
+            self.flush()
+
     def flush(self) -> None:
         feature_collection = {"type": "FeatureCollection", "features": self.features}
         with open(self.geojson_path, "w", encoding="utf-8") as f:
@@ -593,6 +653,13 @@ class OutputManager:
             json.dump(self.audit_log, f, indent=2)
 
         self._pending_since_flush = 0
+
+    def _remove_feature(self, building_id: str) -> bool:
+        before = len(self.features)
+        self.features = [
+            feat for feat in self.features if feat.get("properties", {}).get("building_id") != building_id
+        ]
+        return before != len(self.features)
 
     def _mask_to_geometry(self, mask: np.ndarray) -> Optional[Dict[str, Any]]:
         if mask.sum() == 0:
@@ -643,6 +710,8 @@ class SamAnnotatorApp:
         self.device = device
         self.segmenter = SamSegmenter(model_path=str(args.sam_checkpoint), device=device)
         self.buffer_px = args.chip_buffer
+        prompt_mode = getattr(args, "prompt_mode", "points")
+        self.prompt_mode = prompt_mode if prompt_mode in {"points", "box", "mask"} else "points"
 
         self.entry_index: int = -1
         self.session: Optional[ImageSession] = None
@@ -659,6 +728,9 @@ class SamAnnotatorApp:
         self.canvas_image_ref: Optional[ImageTk.PhotoImage] = None
         self.undo_stack: List[Tuple[str, ColorPoint]] = []
         self.sam_running = False
+        self.show_mask: bool = True
+        self.delete_mode = False
+        self.paint_mode: Optional[str] = None
 
         self.root = tk.Tk()
         self.root.title("SAM Building Refiner")
@@ -705,7 +777,7 @@ class SamAnnotatorApp:
         toolbar.grid(row=1, column=0, columnspan=2, sticky="ew")
         for col in range(10):
             toolbar.columnconfigure(col, weight=0)
-        toolbar.columnconfigure(10, weight=1)
+        toolbar.columnconfigure(9, weight=1)
 
         ttk.Radiobutton(toolbar, text="Positive (+)", variable=self.mode_var, value="positive").grid(row=0, column=0)
         ttk.Radiobutton(toolbar, text="Negative (-)", variable=self.mode_var, value="negative").grid(row=0, column=1)
@@ -721,18 +793,32 @@ class SamAnnotatorApp:
         self.skip_btn.grid(row=0, column=6, padx=(12, 0))
         self.save_image_btn = ttk.Button(toolbar, text="Save & Next Image", command=self.save_and_next_image)
         self.save_image_btn.grid(row=0, column=7, padx=(12, 0))
+
         self.toggle_mask_btn = ttk.Button(toolbar, text="Toggle Mask (m)", command=self.toggle_mask)
-        self.toggle_mask_btn.grid(row=0, column=8, padx=(12, 0))
+        self.toggle_mask_btn.grid(row=1, column=0, padx=(12, 0), pady=(6, 0))
         self.neighbor_accept_btn = ttk.Button(toolbar, text="Accept Nearby", command=self.accept_neighbor_masks)
-        self.neighbor_accept_btn.grid(row=0, column=9, padx=(12, 0))
+        self.neighbor_accept_btn.grid(row=1, column=1, padx=(12, 0), pady=(6, 0))
+        self.delete_btn = ttk.Button(toolbar, text="Delete (d)", command=self.start_delete_mode)
+        self.delete_btn.grid(row=1, column=2, padx=(12, 0), pady=(6, 0))
+
+        self.brush_size = tk.IntVar(value=6)
+        self.brush_btn = ttk.Button(toolbar, text="Brush", command=lambda: self.start_paint_mode("brush"))
+        self.brush_btn.grid(row=1, column=3, padx=(12, 0), pady=(6, 0))
+        self.eraser_btn = ttk.Button(toolbar, text="Eraser", command=lambda: self.start_paint_mode("eraser"))
+        self.eraser_btn.grid(row=1, column=4, padx=(4, 0), pady=(6, 0))
+        ttk.Label(toolbar, text="Size").grid(row=1, column=5, sticky="e", padx=(8, 2), pady=(6, 0))
+        self.brush_spin = tk.Spinbox(toolbar, from_=1, to=64, width=4, textvariable=self.brush_size)
+        self.brush_spin.grid(row=1, column=6, sticky="w", pady=(6, 0))
+        self.finish_brush_btn = ttk.Button(toolbar, text="Done", command=self.finish_paint_mode)
+        self.finish_brush_btn.grid(row=1, column=7, padx=(8, 0), pady=(6, 0))
         self.exit_btn = ttk.Button(toolbar, text="Exit", command=self.finish_and_exit)
-        self.exit_btn.grid(row=0, column=11, padx=(12, 0))
+        self.exit_btn.grid(row=1, column=8, padx=(12, 0), pady=(6, 0))
 
         ttk.Label(
             toolbar,
             text="Scroll/trackpad = zoom, Right/Middle drag = pan, Left-click adds points.",
             foreground="#555",
-        ).grid(row=0, column=12, sticky="e")
+        ).grid(row=1, column=9, sticky="e", pady=(6, 0))
 
         self.action_buttons = [
             self.resegment_btn,
@@ -740,12 +826,17 @@ class SamAnnotatorApp:
             self.skip_btn,
             self.save_image_btn,
             self.neighbor_accept_btn,
+            self.delete_btn,
+            self.brush_btn,
+            self.eraser_btn,
+            self.finish_brush_btn,
         ]
 
     def _bind_events(self) -> None:
         self.building_list.bind("<<ListboxSelect>>", self.on_list_select)
 
         self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.canvas.bind("<ButtonPress-2>", self.on_pan_start)
         self.canvas.bind("<B2-Motion>", self.on_pan_move)
         self.canvas.bind("<ButtonPress-3>", self.on_pan_start)
@@ -765,6 +856,7 @@ class SamAnnotatorApp:
         self.root.bind("-", lambda _: self.adjust_zoom(0.8))
         self.root.bind("_", lambda _: self.adjust_zoom(0.8))
         self.root.bind("m", lambda _: self.toggle_mask())
+        self.root.bind("d", lambda _: self.start_delete_mode())
 
     def set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
@@ -774,6 +866,9 @@ class SamAnnotatorApp:
         self.root.configure(cursor=cursor)
         self.canvas.configure(cursor="watch" if busy else "")
         self.sam_running = busy
+        if busy:
+            self._cancel_delete_mode()
+            self.finish_paint_mode()
 
     def _status_prefix(self) -> str:
         image_idx = self.entry_index + 1 if self.entry_index >= 0 else 0
@@ -804,6 +899,136 @@ class SamAnnotatorApp:
         self.show_mask = not self.show_mask
         state = "shown" if self.show_mask else "hidden"
         self.set_status(f"Mask overlay {state}.")
+        self.render_canvas()
+
+    def start_paint_mode(self, mode: str) -> None:
+        if not self.current_chip or self.sam_running:
+            self.set_status("Load a building and finish any SAM run before painting.")
+            return
+        if self.current_mask_chip is None and self.current_chip is not None:
+            self.current_mask_chip = self.current_chip.initial_mask.copy()
+        if self.current_mask_chip is None:
+            self.set_status("No mask available to edit.")
+            return
+        self.finish_paint_mode()
+        self.paint_mode = mode
+        self._cancel_delete_mode()
+        cursor = "dotbox" if mode == "brush" else "circle"
+        self.canvas.configure(cursor=cursor)
+        label = "Brush" if mode == "brush" else "Eraser"
+        self.set_status(f"{label} mode — click or drag to edit the mask. Click Done when finished.")
+
+    def finish_paint_mode(self) -> None:
+        if self.paint_mode:
+            self.paint_mode = None
+            self.canvas.configure(cursor="")
+
+    def start_delete_mode(self) -> None:
+        if not self.current_building or not self.current_chip:
+            self.set_status("Select a building before deleting.")
+            return
+        if self.sam_running:
+            self.set_status("Wait for the current SAM run to finish before deleting.")
+            return
+        self.finish_paint_mode()
+        if self.current_building.deleted:
+            self.set_status("Building already deleted.")
+            return
+        mask = self.current_mask_chip if self.current_mask_chip is not None else self.current_chip.initial_mask
+        if mask is None or not mask.any():
+            self.set_status("No mask pixels available for deletion.")
+            return
+        self.delete_mode = True
+        self.canvas.configure(cursor="X_cursor")
+        self.set_status("Delete mode — click inside the building to remove it.")
+
+    def _cancel_delete_mode(self) -> None:
+        if self.delete_mode:
+            self.delete_mode = False
+            self.canvas.configure(cursor="")
+
+    def _handle_delete_click(self, chip_x: float, chip_y: float) -> None:
+        self._cancel_delete_mode()
+        if not self.current_building or not self.current_chip:
+            return
+        removed = self._erase_component_at(int(round(chip_x)), int(round(chip_y)))
+        if not removed:
+            self.set_status("No mask pixels at that location; deletion cancelled.")
+            return
+        if self.current_chip:
+            self.current_chip.initial_mask = self.current_mask_chip.copy()
+        if self.current_mask_chip.sum() == 0:
+            self.current_building.deleted = True
+            self.current_building.accepted = False
+            self.current_building.skipped = False
+            self.current_building.clicks_positive.clear()
+            self.current_building.clicks_negative.clear()
+            self.undo_stack.clear()
+            global_mask = np.zeros((self.session.height, self.session.width), dtype=np.uint8)
+            self.current_building.refined_mask = global_mask
+            if self.output_manager is not None:
+                self.output_manager.record_deletion(self.current_building, _now_iso())
+            self._update_building_entry(self.current_building.idx, "✗")
+            self.set_status(f"Deleted {self.current_building.feature_id}.")
+        else:
+            remaining = int(self.current_mask_chip.sum())
+            self.set_status(
+                f"Removed component; {remaining} pixels remain. Delete the rest or refine as needed."
+            )
+        self.render_canvas()
+
+    def _erase_component_at(self, col: int, row: int) -> bool:
+        if self.current_mask_chip is None:
+            return False
+        mask = self.current_mask_chip
+        h, w = mask.shape
+        if not (0 <= row < h and 0 <= col < w):
+            return False
+        if mask[row, col] == 0:
+            return False
+        stack = [(row, col)]
+        while stack:
+            r, c = stack.pop()
+            if mask[r, c] == 0:
+                continue
+            mask[r, c] = 0
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < h and 0 <= nc < w and mask[nr, nc] != 0:
+                    stack.append((nr, nc))
+        self.current_mask_chip = mask
+        return True
+
+    def _apply_brush(self, chip_x: float, chip_y: float) -> None:
+        if not self.paint_mode or not self.current_chip:
+            return
+        if self.current_mask_chip is None:
+            base = self.current_chip.initial_mask
+            if base is None:
+                return
+            self.current_mask_chip = base.copy()
+        mask = self.current_mask_chip
+        radius = max(1, int(self.brush_size.get()))
+        row = int(round(chip_y))
+        col = int(round(chip_x))
+        h, w = mask.shape
+        r0 = max(0, row - radius)
+        r1 = min(h, row + radius + 1)
+        c0 = max(0, col - radius)
+        c1 = min(w, col + radius + 1)
+        if r0 >= r1 or c0 >= c1:
+            return
+        yy, xx = np.ogrid[r0:r1, c0:c1]
+        circle = (yy - row) ** 2 + (xx - col) ** 2 <= radius**2
+        patch = mask[r0:r1, c0:c1]
+        if self.paint_mode == "brush":
+            patch[circle] = 1
+        else:
+            patch[circle] = 0
+        mask[r0:r1, c0:c1] = patch
+        self.current_mask_chip = mask
+        action = "Added" if self.paint_mode == "brush" else "Erased"
+        self.set_status(f"{action} pixels; mask now has {int(mask.sum())} pixels.")
         self.render_canvas()
 
     def _neighbors_in_chip(self, include_current: bool = False) -> List[BuildingMask]:
@@ -843,8 +1068,6 @@ class SamAnnotatorApp:
             annotations_path=annotations_path,
             annotation_crs=self.args.annotation_crs,
             display_bands=self.args.display_bands,
-            display_max_size=self.args.display_max_size,
-            percentile=tuple(self.args.percentile),
         )
 
         if not self.session.buildings:
@@ -873,7 +1096,14 @@ class SamAnnotatorApp:
         if not self.session:
             return
         for building in self.session.buildings:
-            marker = "✓" if building.accepted else ("–" if building.skipped else " ")
+            if building.deleted:
+                marker = "✗"
+            elif building.accepted:
+                marker = "✓"
+            elif building.skipped:
+                marker = "–"
+            else:
+                marker = " "
             self.building_list.insert(tk.END, f"[{marker}] {building.feature_id}")
 
     def goto_building(self, idx: int) -> None:
@@ -909,6 +1139,8 @@ class SamAnnotatorApp:
         building = self.session.buildings[idx]
         self.current_building = building
         self.undo_stack.clear()
+        self._cancel_delete_mode()
+        self.finish_paint_mode()
 
         try:
             chip = self.session.get_chip(building, buffer=self.buffer_px)
@@ -973,10 +1205,10 @@ class SamAnnotatorApp:
                 draw.line(pts + [pts[0]], fill=outline_color, width=1)
 
         for col, row in self._points_to_chip(self.current_building.clicks_positive):
-            radius = 4
+            radius = 2
             draw.ellipse((col - radius, row - radius, col + radius, row + radius), fill=(0, 255, 0, 230))
         for col, row in self._points_to_chip(self.current_building.clicks_negative):
-            radius = 4
+            radius = 2
             draw.ellipse((col - radius, row - radius, col + radius, row + radius), fill=(255, 165, 0, 230))
 
         base = Image.alpha_composite(base, overlay)
@@ -985,7 +1217,7 @@ class SamAnnotatorApp:
             max(1, int(base.width * self.zoom)),
             max(1, int(base.height * self.zoom)),
         )
-        display_img = base.resize(zoomed_size, resample=Image.BILINEAR)
+        display_img = base.resize(zoomed_size, resample=Image.NEAREST)
         self.canvas_image_ref = ImageTk.PhotoImage(display_img)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self.canvas_image_ref)
@@ -1005,6 +1237,13 @@ class SamAnnotatorApp:
         if chip_x < 0 or chip_y < 0 or chip_x >= chip_width or chip_y >= chip_height:
             return
 
+        if self.delete_mode:
+            self._handle_delete_click(chip_x, chip_y)
+            return
+        if self.paint_mode:
+            self._apply_brush(chip_x, chip_y)
+            return
+
         global_col = chip_x + self.current_chip.col_off
         global_row = chip_y + self.current_chip.row_off
         point = (
@@ -1021,6 +1260,19 @@ class SamAnnotatorApp:
 
         self.render_canvas()
         self.set_status("Added prompt; press a to refine or s to accept.")
+
+    def on_canvas_drag(self, event: tk.Event) -> None:
+        if not self.paint_mode or not self.current_chip or not self.current_building:
+            return
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        chip_x = canvas_x / self.zoom
+        chip_y = canvas_y / self.zoom
+        chip_width = self.current_chip.display.shape[1]
+        chip_height = self.current_chip.display.shape[0]
+        if chip_x < 0 or chip_y < 0 or chip_x >= chip_width or chip_y >= chip_height:
+            return
+        self._apply_brush(chip_x, chip_y)
 
     def on_pan_start(self, event: tk.Event) -> None:
         self.canvas.scan_mark(event.x, event.y)
@@ -1044,45 +1296,58 @@ class SamAnnotatorApp:
 
         building = self.current_building
         chip = self.current_chip
-        positive_chip = list(chip.default_positive_chip)
-        negative_chip = list(chip.default_negative_chip)
+        chip_height, chip_width = self.current_chip.display.shape[:2]
+        if building.deleted:
+            self.set_status("Cannot refine a building that has been deleted.")
+            return
+
+        positive_chip: List[ColorPoint] = []
+        negative_chip: List[ColorPoint] = []
+        if self.prompt_mode == "points" and chip.rough_centroid:
+            positive_chip.append(chip.rough_centroid)
         positive_chip.extend(self._points_to_chip(building.clicks_positive))
         negative_chip.extend(self._points_to_chip(building.clicks_negative))
 
-        if not positive_chip:
-            self.set_status("Add at least one positive click before running SAM.")
-            return
-
-        coords = np.array(positive_chip + negative_chip, dtype=np.float32)
-        labels = np.concatenate(
-            (
-                np.ones(len(positive_chip), dtype=np.int32),
-                np.zeros(len(negative_chip), dtype=np.int32),
+        coords: Optional[np.ndarray] = None
+        labels: Optional[np.ndarray] = None
+        if positive_chip or negative_chip:
+            coords = np.array(positive_chip + negative_chip, dtype=np.float32)
+            coords[:, 0] = np.clip(coords[:, 0], 0, chip_width - 1)
+            coords[:, 1] = np.clip(coords[:, 1], 0, chip_height - 1)
+            labels = np.concatenate(
+                (
+                    np.ones(len(positive_chip), dtype=np.int32),
+                    np.zeros(len(negative_chip), dtype=np.int32),
+                )
             )
-        )
 
-        chip_height, chip_width = self.current_chip.display.shape[:2]
-        coords[:, 0] = np.clip(coords[:, 0], 0, chip_width - 1)
-        coords[:, 1] = np.clip(coords[:, 1], 0, chip_height - 1)
+        mask_prompt: Optional[np.ndarray] = None
+        if self.prompt_mode == "mask":
+            initial_mask = chip.initial_mask
+            if initial_mask is not None and initial_mask.any():
+                mask_prompt = np.ascontiguousarray(initial_mask.astype(np.uint8))
 
-        bbox = np.array(
-            [
-                coords[:, 0].min(),
-                coords[:, 1].min(),
-                coords[:, 0].max(),
-                coords[:, 1].max(),
-            ],
-            dtype=np.float32,
-        )
-        bbox[0] = max(0.0, bbox[0] - 2.0)
-        bbox[1] = max(0.0, bbox[1] - 2.0)
-        bbox[2] = min(float(chip_width - 1), bbox[2] + 2.0)
-        bbox[3] = min(float(chip_height - 1), bbox[3] + 2.0)
-        if bbox[2] - bbox[0] < 4 or bbox[3] - bbox[1] < 4:
-            bbox[0] = max(0.0, bbox[0] - 4.0)
-            bbox[1] = max(0.0, bbox[1] - 4.0)
-            bbox[2] = min(float(chip_width - 1), bbox[2] + 4.0)
-            bbox[3] = min(float(chip_height - 1), bbox[3] + 4.0)
+        bbox: Optional[np.ndarray] = None
+        if self.prompt_mode == "box" and chip.rough_bbox:
+            x0, y0, x1, y1 = chip.rough_bbox
+            pad = 2.0
+            bbox = np.array(
+                [
+                    max(0.0, x0 - pad),
+                    max(0.0, y0 - pad),
+                    min(float(chip_width - 1), x1 + pad),
+                    min(float(chip_height - 1), y1 + pad),
+                ],
+                dtype=np.float32,
+            )
+            if bbox[2] <= bbox[0]:
+                bbox[2] = min(float(chip_width - 1), bbox[0] + 4.0)
+            if bbox[3] <= bbox[1]:
+                bbox[3] = min(float(chip_height - 1), bbox[1] + 4.0)
+
+        if coords is None and mask_prompt is None and bbox is None:
+            self.set_status("No prompts available — add clicks or choose a different prompt mode.")
+            return
 
         chip_rgb = self.current_chip_rgb
         if chip_rgb is None:
@@ -1097,12 +1362,21 @@ class SamAnnotatorApp:
         def work() -> None:
             try:
                 self.segmenter.set_image(chip_rgb)
-                mask = self.segmenter.predict(coords, labels, box=bbox)
+                mask = self.segmenter.predict(
+                    point_coords=coords,
+                    point_labels=labels,
+                    box=bbox,
+                    mask_input=mask_prompt,
+                )
             except Exception as exc:  # pragma: no cover - UI only
+                import traceback
+
+                traceback.print_exc()
+                err_msg = str(exc) if str(exc) else exc.__class__.__name__
                 def report_error() -> None:
                     self.sam_running = False
                     self.set_busy(False)
-                    self.set_status(f"SAM error: {exc}")
+                    self.set_status(f"SAM error: {err_msg}")
 
                 self.root.after(0, report_error)
                 return
@@ -1209,6 +1483,9 @@ class SamAnnotatorApp:
         if not self.session or not self.current_building or self.current_mask_chip is None or not self.current_chip:
             messagebox.showinfo("Nothing to save", "Use the existing polygon or run SAM before accepting.")
             return
+        if self.current_building.deleted:
+            self.set_status("Building marked as deleted; no mask to accept.")
+            return
         if self.current_building.accepted:
             self.set_status("Already saved for this building.")
             return
@@ -1232,6 +1509,10 @@ class SamAnnotatorApp:
 
     def skip_building(self) -> None:
         if not self.current_building:
+            return
+        if self.current_building.deleted:
+            self.set_status(f"{self.current_building.feature_id} already deleted.")
+            self.goto_building(self.current_building.idx + 1)
             return
         self.current_building.skipped = True
         self.current_building.accepted = False
@@ -1261,7 +1542,7 @@ class SamAnnotatorApp:
         neighbors = self._neighbors_in_chip(include_current=False)
         accepted_count = 0
         for building in neighbors:
-            if building.accepted:
+            if building.accepted or building.deleted:
                 continue
             mask = self.session.rasterize_building(building)
             building.refined_mask = mask
@@ -1360,14 +1641,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cities", nargs="+", help="Optional list of city names to process from the images directory.")
     parser.add_argument("--annotation-crs", type=str, help="CRS of the GeoJSON (if not embedded).")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory where outputs are saved.")
-    parser.add_argument("--sam-checkpoint", type=Path, default=Path("sam_b.pt"), help="Path to SAM checkpoint.")
-    parser.add_argument("--chip-buffer", type=int, default=96, help="Pixel buffer around each polygon chip.")
+    parser.add_argument(
+        "--sam-checkpoint",
+        type=Path,
+        default=Path("sam2.1_b.pt"),
+        help="Path to the SAM 2.1 checkpoint.",
+    )
+    parser.add_argument("--chip-buffer", type=int, default=128, help="Pixel buffer around each polygon chip.")
     parser.add_argument("--display-bands", type=int, nargs=3, help="Raster band indices for RGB display (1-based).")
-    parser.add_argument("--display-max-size", type=int, default=1400, help="Resize images for display if larger than this.")
     parser.add_argument("--save-mask-tif", action="store_true", help="Write GeoTIFF masks alongside GeoJSON.")
     parser.add_argument("--autosave-every", type=int, default=1, help="Autosave cadence in number of accepted buildings.")
-    parser.add_argument("--percentile", type=float, nargs=2, default=(2.0, 98.0), help="Percentile stretch for display RGB.")
-    return parser.parse_args()
+    parser.add_argument(
+        "--prompt-mode",
+        choices=("points", "box", "mask"),
+        default="points",
+        help="Initial SAM prompt type: centroid point, bounding box, or full polygon mask.",
+    )
+    args = parser.parse_args()
+    return args
 
 
 def determine_entries(args: argparse.Namespace) -> List[Tuple[Path, Path]]:
